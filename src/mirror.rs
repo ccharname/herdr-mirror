@@ -537,6 +537,9 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         }
     }
     for rid in drop_panes {
+        log.log(&format!(
+            "pane mirror for {rid} dropped — its workspace mirror was already gone/tombstoned this pass (remote pane not closed)"
+        ));
         state.panes.remove(&rid);
     }
 
