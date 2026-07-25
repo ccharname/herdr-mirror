@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::api::ApiClient;
-use crate::config::HostConfig;
+use crate::config::{HostConfig, MirrorMode};
 use crate::state::{load_state, save_state, HostState, PaneEntry, WsEntry};
 use crate::util::{Logger, Result};
 
@@ -302,7 +302,11 @@ fn resolve_ws_label(
     local_label: &str,
     last_remote: Option<&str>,
 ) -> LabelAction {
-    let expected = format!("{prefix}: {remote_label}");
+    let expected = if prefix.is_empty() {
+        remote_label.to_string()
+    } else {
+        format!("{prefix}: {remote_label}")
+    };
     if local_label == expected {
         return LabelAction::InSync;
     }
@@ -310,8 +314,17 @@ fn resolve_ws_label(
         // remote changed since we last stamped (or no history) — remote wins
         return LabelAction::RestampLocal;
     }
-    // remote unchanged, local differs → this is a user rename. Accept it with
-    // or without the "<prefix>: " convention; empty/degenerate names restamp.
+    // remote unchanged, local differs — could be a user rename, or a prefix
+    // change (e.g. from "oldmac: oaazgg" to "⤿: oaazgg"). Detect prefix
+    // changes: if any "<word>: " prefix stripped from local matches the
+    // remote label, it's just a prefix change → restamp local.
+    if let Some(rest) = local_label.splitn(2, ": ").nth(1) {
+        if rest.trim() == remote_label {
+            return LabelAction::RestampLocal;
+        }
+    }
+    // Accept the user rename with or without the "<prefix>: " convention;
+    // empty/degenerate names restamp.
     let stripped =
         local_label.strip_prefix(&format!("{prefix}: ")).unwrap_or(local_label).trim();
     if stripped.is_empty() || stripped == remote_label {
@@ -611,7 +624,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         if mirror_ws_ids.contains(&rws.workspace_id) {
             continue;
         }
-        let label = format!("{}: {}", host.prefix, rws.label);
+        let label = if host.mode == MirrorMode::Native {
+            rws.label.clone()
+        } else {
+            format!("{}: {}", host.prefix, rws.label)
+        };
         if state.workspaces.get(&rws.workspace_id).is_some_and(|e| e.is_tombstoned()) {
             continue;
         }
@@ -623,7 +640,8 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
         if let Some(entry) = existing {
             let local_ws = local_snap.workspaces.iter().find(|w| w.workspace_id == entry.local_id);
             if let Some(lws) = local_ws {
-                match resolve_ws_label(&host.prefix, &rws.label, &lws.label, entry.last_remote_label.as_deref()) {
+                let eff_prefix = if host.mode == MirrorMode::Native { "" } else { &host.prefix };
+                match resolve_ws_label(eff_prefix, &rws.label, &lws.label, entry.last_remote_label.as_deref()) {
                     LabelAction::PushRemote(new_remote) => {
                         // the user renamed the mirror → the rename is intent for
                         // the REMOTE workspace; push it there and restamp local
@@ -638,7 +656,11 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                                 json!({ "workspace_id": rws.workspace_id, "label": new_remote }),
                             )
                             .await?;
-                        let stamped = format!("{}: {}", host.prefix, new_remote);
+                        let stamped = if host.mode == MirrorMode::Native {
+                            new_remote.clone()
+                        } else {
+                            format!("{}: {}", host.prefix, new_remote)
+                        };
                         if lws.label != stamped {
                             deps.local
                                 .request("workspace.rename", json!({ "workspace_id": entry.local_id, "label": stamped }))
@@ -738,6 +760,28 @@ async fn converge_inner(deps: &ConvergeDeps, state: &mut HostState) -> Result<()
                 json!({ "workspace_id": entry.local_id, "source": source, "tokens": rws.tokens }),
             )
             .await;
+    }
+
+    // 3c. native mode: push a local $rhost token so the sidebar can show
+    //     which remote host each mirror workspace belongs to.
+    if host.mode == MirrorMode::Native {
+        let rhost_tokens = json!({ "rhost": host.name });
+        for rws in &remote_snap.workspaces {
+            if mirror_ws_ids.contains(&rws.workspace_id) {
+                continue;
+            }
+            let Some(entry) = state.workspaces.get(&rws.workspace_id) else { continue };
+            if entry.is_tombstoned() || !local_ws_ids.contains(&entry.local_id) {
+                continue;
+            }
+            let _ = deps
+                .local
+                .request(
+                    "workspace.report_metadata",
+                    json!({ "workspace_id": entry.local_id, "source": source, "tokens": rhost_tokens }),
+                )
+                .await;
+        }
     }
 
     // 4. remote tabs → replicate layout with wrapper commands
@@ -1225,6 +1269,7 @@ mod tests {
             prefix: "vps".into(),
             remote_bin: "~/.local/bin/herdr".into(),
             always_control: true,
+            mode: crate::config::MirrorMode::Composite,
         }
     }
 

@@ -7,6 +7,16 @@ use serde::Deserialize;
 
 use crate::util::{err, Result};
 
+/// How mirror panes map to remote panes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MirrorMode {
+    /// One composite pane per remote workspace (existing behaviour).
+    Composite,
+    /// 1:1 native panes — each remote pane gets its own local proxy pane,
+    /// always in control mode, with a `$rhost` sidebar token.
+    Native,
+}
+
 /// How to reach a host. `Ssh` is the default and the only kind that existed
 /// before container support; every existing hosts.toml parses to it.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,7 +49,11 @@ pub struct HostConfig {
     /// keep each mirror pane in control (writable, no idle release, and sized to
     /// the local pane so it fills). Default on; ideal for headless remotes. Turn
     /// off per host for a remote a human is actively using directly.
+    /// Native mode forces this true.
     pub always_control: bool,
+    /// How mirror panes map to remote panes. Composite = one big pane per
+    /// workspace (existing default). Native = 1:1 pane mapping with host token.
+    pub mode: MirrorMode,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +115,7 @@ struct RawHost {
     remote_bin: Option<String>,
     enabled: Option<bool>,
     always_control: Option<bool>,
+    mode: Option<String>,
 }
 
 /// Resolve `kind` + its ref fields, rejecting combinations that would silently
@@ -198,14 +213,29 @@ pub fn parse_config(text: &str) -> Result<MirrorConfig> {
                 continue;
             }
         };
+        let mode = match h.mode.as_deref().unwrap_or("composite") {
+            "composite" => MirrorMode::Composite,
+            "native" => MirrorMode::Native,
+            other => {
+                warnings.push(format!(
+                    "[hosts.{name}]: unknown mode \"{other}\" (expected composite or native), falling back to composite"
+                ));
+                MirrorMode::Composite
+            }
+        };
+        let always_control = match mode {
+            MirrorMode::Native => true,  // native mode forces always_control
+            MirrorMode::Composite => h.always_control.unwrap_or(global_always_control),
+        };
         hosts.push(HostConfig {
             prefix: h.prefix.unwrap_or_else(|| name.clone()),
             remote_bin: h.remote_bin.unwrap_or_else(|| "~/.local/bin/herdr".into()),
-            always_control: h.always_control.unwrap_or(global_always_control),
+            always_control,
             docker_bin: h.docker_bin.unwrap_or_else(|| "docker".into()),
             kind,
             target,
             name,
+            mode,
         });
     }
     if hosts.is_empty() {
@@ -253,6 +283,7 @@ mod tests {
         assert_eq!(h.prefix, "work");
         assert_eq!(h.remote_bin, "~/.local/bin/herdr");
         assert!(h.always_control); // default on
+        assert_eq!(h.mode, MirrorMode::Composite); // default composite
     }
 
     #[test]
@@ -268,6 +299,28 @@ mod tests {
         let b = c.hosts.iter().find(|h| h.name == "b").unwrap();
         assert!(!a.always_control); // inherits global off
         assert!(b.always_control); // per-host override on
+    }
+
+    #[test]
+    fn native_mode_forces_always_control() {
+        let c = parse_config(
+            "always_control = false\n\
+             [hosts.a]\ntarget = \"a\"\nmode = \"native\"\n",
+        )
+        .unwrap();
+        let a = &c.hosts[0];
+        assert_eq!(a.mode, MirrorMode::Native);
+        assert!(a.always_control); // native forces true even when global is false
+    }
+
+    #[test]
+    fn unknown_mode_falls_back_with_warning() {
+        let c = parse_config(
+            "[hosts.a]\ntarget = \"a\"\nmode = \"weird\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.hosts[0].mode, MirrorMode::Composite);
+        assert_eq!(c.warnings.len(), 1);
     }
 
     #[test]
